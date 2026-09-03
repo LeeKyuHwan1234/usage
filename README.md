@@ -15,6 +15,14 @@ Codex와 Claude Code의 구독형 사용량을 Windows 시스템 트레이와 �
 
 ## 가장 쉬운 실행 방법
 
+### 다운로드
+
+최신 배포본은 아래 링크에서 받을 수 있습니다.
+
+[AI Usage Dashboard 최신 ZIP 다운로드](https://github.com/LeeKyuHwan1234/usage/releases/latest/download/AI-Usage-Dashboard-v1.0.0.zip)
+
+ZIP 파일을 압축 해제한 뒤 `AI Usage Dashboard.vbs`를 더블클릭하세요.
+
 `AI Usage Dashboard.vbs`를 더블클릭하세요. PowerShell이나 콘솔 창이 열리지 않고 시스템 트레이에서 실행됩니다.
 
 처음 실행하면 사용할 제공자를 선택하는 등록 화면이 나타납니다.
