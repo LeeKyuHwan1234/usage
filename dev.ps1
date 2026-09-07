@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     # Leave empty to use the Windows account that starts this app.
     [string]$UserDataRoot = $env:USERPROFILE,
@@ -15,6 +15,48 @@ if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName PresentationFramework
+Add-Type -ReferencedAssemblies @('System.Windows.Forms', 'System.Drawing') -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public static class UsageTaskbarNative
+{
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern IntPtr FindWindow(string className, string windowName);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr childAfter, string className, string windowName);
+    [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetParent(IntPtr child, IntPtr newParent);
+    [DllImport("user32.dll", SetLastError = true)] public static extern int GetWindowLong(IntPtr window, int index);
+    [DllImport("user32.dll", SetLastError = true)] public static extern int SetWindowLong(IntPtr window, int index, int style);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool GetWindowRect(IntPtr window, out RECT rectangle);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool MoveWindow(IntPtr window, int x, int y, int width, int height, bool repaint);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr", SetLastError = true)] static extern IntPtr SetWindowLongPtr64(IntPtr window, int index, IntPtr value);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLong", SetLastError = true)] static extern IntPtr SetWindowLongPtr32(IntPtr window, int index, IntPtr value);
+    public static IntPtr SetWindowOwner(IntPtr window, IntPtr owner) { return IntPtr.Size == 8 ? SetWindowLongPtr64(window, -8, owner) : SetWindowLongPtr32(window, -8, owner); }
+}
+
+public sealed class UsageTaskbarLayer : Form
+{
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] struct SIZE { public int Width, Height; }
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr window);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr window, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr value);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr value);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool UpdateLayeredWindow(IntPtr window, IntPtr destinationDc, ref POINT destination, ref SIZE size, IntPtr sourceDc, ref POINT source, int colorKey, ref BLENDFUNCTION blend, int flags);
+    protected override CreateParams CreateParams { get { var p = base.CreateParams; p.ExStyle |= 0x00080000 | 0x00000080; return p; } }
+    public void SetBitmap(Bitmap bitmap, int x, int y) {
+        IntPtr screen = GetDC(IntPtr.Zero), memory = CreateCompatibleDC(screen), handle = bitmap.GetHbitmap(Color.FromArgb(0)), old = SelectObject(memory, handle);
+        try { var dest = new POINT { X=x, Y=y }; var source = new POINT(); var size = new SIZE { Width=bitmap.Width, Height=bitmap.Height }; var blend = new BLENDFUNCTION { BlendOp=0, SourceConstantAlpha=255, AlphaFormat=1 }; if (!UpdateLayeredWindow(Handle, screen, ref dest, ref size, memory, ref source, 0, ref blend, 2)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+        finally { SelectObject(memory, old); DeleteObject(handle); DeleteDC(memory); ReleaseDC(IntPtr.Zero, screen); }
+    }
+}
+'@
 
 # Keep one tray dashboard per Windows user. The setup window is allowed separately.
 if (-not $Setup) {
@@ -55,9 +97,38 @@ function Get-ProviderSetupMessage($provider) {
     return 'Setup required: open Claude Code and sign in to Claude.ai.'
 }
 
+function Get-ClaudeOAuth($userRoot) {
+    $credentialPath = Join-Path $userRoot '.claude\.credentials.json'
+    $credential = Get-JsonFile $credentialPath
+    $oauth = $credential.claudeAiOauth
+    if (-not $oauth.accessToken) { return @{ error = Get-ProviderSetupMessage 'Claude' } }
+
+    # Claude Code OAuth access tokens are short-lived. Refresh before use when expired or nearly expired.
+    $expiresAt = if ($oauth.expiresAt) { [int64]$oauth.expiresAt } else { 0 }
+    if ($expiresAt -gt 0 -and $expiresAt -le ([DateTimeOffset]::Now.ToUnixTimeMilliseconds() + 120000)) {
+        if (-not $oauth.refreshToken) { return @{ error = 'Claude session expired. Run claude auth login.' } }
+        $body = @{ grant_type = 'refresh_token'; refresh_token = $oauth.refreshToken; client_id = '9d1c250a-e61b-44d9-88ed-5944d1962f5e' } | ConvertTo-Json -Compress
+        $refreshError = $null; $refreshed = $null
+        foreach ($endpoint in @('https://platform.claude.com/v1/oauth/token', 'https://console.anthropic.com/v1/oauth/token')) {
+            try {
+                $refreshed = Invoke-RestMethod -Method Post -Uri $endpoint -ContentType 'application/json' -Headers @{ Accept = 'application/json'; 'User-Agent' = 'ai-usage-dashboard-local' } -Body $body -TimeoutSec 15
+                if ($refreshed.access_token) { break }
+            } catch { $refreshError = $_.Exception.Message }
+        }
+        if (-not $refreshed.access_token) { return @{ error = "Claude session refresh failed: $refreshError" } }
+        $oauth.accessToken = $refreshed.access_token
+        if ($refreshed.refresh_token) { $oauth.refreshToken = $refreshed.refresh_token }
+        if ($refreshed.expires_in) { $oauth.expiresAt = [DateTimeOffset]::Now.ToUnixTimeMilliseconds() + ([int64]$refreshed.expires_in * 1000) }
+        elseif ($refreshed.expires_at) { $oauth.expiresAt = [int64]$refreshed.expires_at }
+        $credential.claudeAiOauth = $oauth
+        $credential | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $credentialPath -Encoding UTF8
+    }
+    return $oauth
+}
+
 function Save-ProviderSettings($codexEnabled, $claudeEnabled) {
     New-Item -ItemType Directory -Force -Path $script:settingsDir | Out-Null
-    [pscustomobject]@{ showCodex = [bool]$codexEnabled; showClaude = [bool]$claudeEnabled; showBadge = if ($script:settings.showBadge -ne $null) { [bool]$script:settings.showBadge } else { $true }; badgeLeft = if ($script:settings.badgeLeft -ne $null) { $script:settings.badgeLeft } else { $null }; badgeTop = if ($script:settings.badgeTop -ne $null) { $script:settings.badgeTop } else { $null } } | ConvertTo-Json | Set-Content -LiteralPath $script:settingsFile -Encoding UTF8
+    [pscustomobject]@{ showCodex = [bool]$codexEnabled; showClaude = [bool]$claudeEnabled; showTaskbarWidget = if ($script:settings.showTaskbarWidget -ne $null) { [bool]$script:settings.showTaskbarWidget } else { $true } } | ConvertTo-Json | Set-Content -LiteralPath $script:settingsFile -Encoding UTF8
     $script:settings = Get-JsonFile $script:settingsFile
 }
 
@@ -98,8 +169,8 @@ function Get-Usage($provider) {
         return $cached.value
     }
     if ($provider -eq 'Claude') {
-        $auth = (Get-JsonFile (Join-Path $UserDataRoot '.claude\.credentials.json')).claudeAiOauth
-        if (-not $auth.accessToken) { return @{ error = Get-ProviderSetupMessage 'Claude' } }
+        $auth = Get-ClaudeOAuth $UserDataRoot
+        if ($auth.error) { return @{ error = $auth.error } }
         $uri = 'https://api.anthropic.com/api/oauth/usage'
         $headers = @{ Authorization = "Bearer $($auth.accessToken)"; 'anthropic-version' = '2023-06-01'; 'User-Agent' = 'usage-dashboard-local' }
     } else {
@@ -143,17 +214,135 @@ function Get-UsagePercent($data) {
 function Get-ResetText($data, [switch]$Weekly) {
     $format = if ($Weekly) { 'MM/dd HH:mm' } else { 'HH:mm' }
     if ($null -ne $data.used_percent) {
-        if ($data.reset_at) { return "Resets " + [DateTimeOffset]::FromUnixTimeSeconds([int64]$data.reset_at).ToLocalTime().ToString($format) }
+        if ($data.reset_at) { return "초기화 " + [DateTimeOffset]::FromUnixTimeSeconds([int64]$data.reset_at).ToLocalTime().ToString($format) }
     } elseif ($data.resets_at) {
-        return "Resets " + ([datetime]$data.resets_at).ToLocalTime().ToString($format)
+        return "초기화 " + ([datetime]$data.resets_at).ToLocalTime().ToString($format)
     }
-    return 'Reset time unavailable'
+    return '초기화 시간 정보 없음'
 }
 
 function Get-GaugeColor($percent) {
     if ($percent -ge 80) { return [System.Drawing.Color]::FromArgb(220, 38, 38) }
     if ($percent -ge 60) { return [System.Drawing.Color]::FromArgb(217, 119, 6) }
     return [System.Drawing.Color]::FromArgb(34, 197, 94)
+}
+
+function Test-TaskbarWidgetEnabled {
+    return (-not $script:settings -or $script:settings.showTaskbarWidget -ne $false)
+}
+
+function Get-TaskbarWidgetWidth {
+    $count = [int][bool]$script:settings.showCodex + [int][bool]$script:settings.showClaude
+    if ($count -le 0) { return 0 }
+    # Keep a little breathing room around the compact taskbar readout.
+    return 214
+}
+
+function Draw-ProviderIcon($graphics, $provider, $x, $y) {
+    if (-not $script:providerLogoCache) { $script:providerLogoCache = @{} }
+    if (-not $script:providerLogoCache.ContainsKey($provider)) {
+        $fileName = if ($provider -eq 'CLAUDE') { 'claude.png' } else { 'chatgpt.png' }
+        $filePath = Join-Path $PSScriptRoot (Join-Path 'assets' $fileName)
+        if (Test-Path $filePath) {
+            # Clone the image so the source file is not locked while the app is running.
+            $source = [System.Drawing.Image]::FromFile($filePath)
+            try {
+                $logo = [System.Drawing.Bitmap]::new($source)
+                # ChatGPT has a white background; Claude has a beige background
+                # just inside a nearly transparent edge pixel.
+                # Convert that background to alpha so only the logo is drawn on the taskbar.
+                $backgroundPixel = if ($provider -eq 'CLAUDE') { $logo.GetPixel(10, 10) } else { $logo.GetPixel(0, 0) }
+                $logo.MakeTransparent($backgroundPixel)
+                $script:providerLogoCache[$provider] = $logo
+            } finally { $source.Dispose() }
+        }
+    }
+
+    $icon = $script:providerLogoCache[$provider]
+    if ($icon) {
+        $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        if ($provider -eq 'CODEX') {
+            # The original ChatGPT icon has generous white padding. Crop it and
+            # place it on a white round chip so its black knot remains readable.
+            $chip = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(248, 250, 252))
+            try { $graphics.FillEllipse($chip, $x, $y + 1, 14, 14) } finally { $chip.Dispose() }
+            $graphics.DrawImage($icon, [System.Drawing.Rectangle]::new($x + 1, $y + 2, 12, 12), 40, 40, 176, 176, [System.Drawing.GraphicsUnit]::Pixel)
+        } else {
+            # Crop Claude's edge padding so the orange starburst is legible.
+            $graphics.DrawImage($icon, [System.Drawing.Rectangle]::new($x, $y + 1, 14, 14), 40, 40, 258, 258, [System.Drawing.GraphicsUnit]::Pixel)
+        }
+    }
+}
+
+function Draw-TaskbarUsageRow($graphics, $label, $result, $y, $x) {
+    $textColor = if ($script:taskbarLightTheme) { [System.Drawing.Color]::FromArgb(31, 41, 55) } else { [System.Drawing.Color]::FromArgb(241, 245, 249) }
+    $valueFont = [System.Drawing.Font]::new('Segoe UI', 7)
+    $valueBrush = [System.Drawing.SolidBrush]::new($textColor)
+    $five = $null; $seven = $null
+    if ($result -and -not $result.error) { $five = Get-UsagePercent $result.five; $seven = Get-UsagePercent $result.seven }
+    Draw-ProviderIcon $graphics $label $x $y
+    $graphics.DrawString('5h', $valueFont, $valueBrush, $x + 28, $y)
+    $graphics.DrawString('/', $valueFont, $valueBrush, $x + 46, $y)
+    $graphics.DrawString($(if ($null -eq $five) { '--' } else { "$five%" }), $valueFont, $valueBrush, $x + 55, $y)
+    $fiveBrush = [System.Drawing.SolidBrush]::new($(if ($null -eq $five) { [System.Drawing.Color]::FromArgb(100, 116, 139) } else { Get-GaugeColor $five }))
+    $trackColor = if ($script:taskbarLightTheme) { [System.Drawing.Color]::FromArgb(190, 190, 190) } else { [System.Drawing.Color]::FromArgb(71, 85, 105) }
+    $fiveTrack = [System.Drawing.Rectangle]::new($x + 78, $y + 5, 27, 5)
+    Draw-RoundedRectangle $graphics $trackColor $fiveTrack 3
+    if ($null -ne $five -and $five -gt 0) { Draw-RoundedRectangle $graphics $fiveBrush.Color ([System.Drawing.Rectangle]::new($fiveTrack.X, $fiveTrack.Y, [Math]::Max(1, [Math]::Round($fiveTrack.Width * $five / 100)), $fiveTrack.Height)) 3 }
+    $graphics.DrawString('7d', $valueFont, $valueBrush, $x + 111, $y)
+    $graphics.DrawString('/', $valueFont, $valueBrush, $x + 129, $y)
+    $graphics.DrawString($(if ($null -eq $seven) { '--' } else { "$seven%" }), $valueFont, $valueBrush, $x + 138, $y)
+    $sevenBrush = [System.Drawing.SolidBrush]::new($(if ($null -eq $seven) { [System.Drawing.Color]::FromArgb(100, 116, 139) } else { Get-GaugeColor $seven }))
+    $sevenTrack = [System.Drawing.Rectangle]::new($x + 161, $y + 5, 28, 5)
+    Draw-RoundedRectangle $graphics $trackColor $sevenTrack 3
+    if ($null -ne $seven -and $seven -gt 0) { Draw-RoundedRectangle $graphics $sevenBrush.Color ([System.Drawing.Rectangle]::new($sevenTrack.X, $sevenTrack.Y, [Math]::Max(1, [Math]::Round($sevenTrack.Width * $seven / 100)), $sevenTrack.Height)) 3 }
+    $sevenBrush.Dispose(); $fiveBrush.Dispose(); $valueBrush.Dispose(); $valueFont.Dispose()
+}
+
+function Update-TaskbarWidgetBitmap($x, $y, $width, $height) {
+    $bitmap = [System.Drawing.Bitmap]::new($width, $height, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.Clear([System.Drawing.Color]::FromArgb(1, 0, 0, 0))
+        $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $rowY = 5
+        if ($script:settings.showCodex) { Draw-TaskbarUsageRow $graphics 'CODEX' $script:lastCodexResult $rowY 14; $rowY += 19 }
+        if ($script:settings.showClaude) { Draw-TaskbarUsageRow $graphics 'CLAUDE' $script:lastClaudeResult $rowY 14 }
+        $taskbarWidget.SetBitmap($bitmap, $x, $y)
+    } finally { $graphics.Dispose(); $bitmap.Dispose() }
+}
+
+function Set-TaskbarWidgetPosition {
+    if (-not $taskbarWidget -or $taskbarWidget.IsDisposed) { return }
+    if (-not (Test-TaskbarWidgetEnabled)) { $taskbarWidget.Hide(); return }
+    $width = Get-TaskbarWidgetWidth
+    if ($width -le 0) { $taskbarWidget.Hide(); return }
+    $taskbar = [UsageTaskbarNative]::FindWindow('Shell_TrayWnd', $null)
+    if ($taskbar -eq [IntPtr]::Zero) { $taskbarWidget.Hide(); return }
+    $taskbarRect = [UsageTaskbarNative+RECT]::new()
+    if (-not [UsageTaskbarNative]::GetWindowRect($taskbar, [ref]$taskbarRect)) { return }
+    $trayArea = [UsageTaskbarNative]::FindWindowEx($taskbar, [IntPtr]::Zero, 'TrayNotifyWnd', $null)
+    $rightEdge = $taskbarRect.Right - $taskbarRect.Left - 168
+    if ($trayArea -ne [IntPtr]::Zero) { $trayRect = [UsageTaskbarNative+RECT]::new(); if ([UsageTaskbarNative]::GetWindowRect($trayArea, [ref]$trayRect)) { $rightEdge = $trayRect.Left - $taskbarRect.Left } }
+    $height = [Math]::Min(44, [Math]::Max(38, $taskbarRect.Bottom - $taskbarRect.Top - 2))
+    $x = $taskbarRect.Left + [Math]::Max(4, $rightEdge - $width - 5)
+    $y = $taskbarRect.Top + [Math]::Floor((($taskbarRect.Bottom - $taskbarRect.Top) - $height) / 2)
+    if ($script:taskbarOwner -ne $taskbar) {
+        $style = [UsageTaskbarNative]::GetWindowLong($taskbarWidget.Handle, -16)
+        $style = ($style -band (-bnot 0x40000000) -band (-bnot 0x04000000)) -bor (-2147483648)
+        $null = [UsageTaskbarNative]::SetWindowLong($taskbarWidget.Handle, -16, [int]$style)
+        $exStyle = [UsageTaskbarNative]::GetWindowLong($taskbarWidget.Handle, -20)
+        $exStyle = $exStyle -band (-bnot 0x00000020) -band (-bnot 0x08000000) -bor 0x00000080 -bor 0x00000008
+        $null = [UsageTaskbarNative]::SetWindowLong($taskbarWidget.Handle, -20, [int]$exStyle)
+        $null = [UsageTaskbarNative]::SetParent($taskbarWidget.Handle, [IntPtr]::Zero)
+        $null = [UsageTaskbarNative]::SetWindowOwner($taskbarWidget.Handle, $taskbar)
+        $null = [UsageTaskbarNative]::SetWindowPos($taskbarWidget.Handle, [IntPtr](-1), 0, 0, 0, 0, 0x0037)
+        $script:taskbarOwner = $taskbar
+    }
+    $taskbarWidget.ClientSize = [System.Drawing.Size]::new($width, $height)
+    if (-not $taskbarWidget.Visible) { $taskbarWidget.Show() }
+    Update-TaskbarWidgetBitmap $x $y $width $height
+    $null = [UsageTaskbarNative]::SetWindowPos($taskbarWidget.Handle, [IntPtr](-1), $x, $y, $width, $height, 0x0010)
 }
 
 function New-RoundedPath($rectangle, $radius) {
@@ -218,8 +407,8 @@ function New-UsageCard($title) {
     $titleLabel = [System.Windows.Forms.Label]::new()
     $titleLabel.Text = $title; $titleLabel.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $titleLabel.ForeColor = [System.Drawing.Color]::FromArgb(226, 232, 240); $titleLabel.Location = [System.Drawing.Point]::new(18, 14); $titleLabel.AutoSize = $true; $titleLabel.BackColor = $cardBackground
-    $session = [System.Windows.Forms.Label]::new(); $session.Text = '5h session'; $session.Font = [System.Drawing.Font]::new('Segoe UI', 8, [System.Drawing.FontStyle]::Bold); $session.Location = [System.Drawing.Point]::new(18, 42); $session.AutoSize = $true; $session.BackColor = $cardBackground; $session.ForeColor = [System.Drawing.Color]::FromArgb(203, 213, 225)
-    $week = [System.Windows.Forms.Label]::new(); $week.Text = '7d weekly'; $week.Font = [System.Drawing.Font]::new('Segoe UI', 8, [System.Drawing.FontStyle]::Bold); $week.Location = [System.Drawing.Point]::new(18, 94); $week.AutoSize = $true; $week.BackColor = $cardBackground; $week.ForeColor = [System.Drawing.Color]::FromArgb(203, 213, 225)
+    $session = [System.Windows.Forms.Label]::new(); $session.Text = '5시간 세션'; $session.Font = [System.Drawing.Font]::new('Segoe UI', 8, [System.Drawing.FontStyle]::Bold); $session.Location = [System.Drawing.Point]::new(18, 42); $session.AutoSize = $true; $session.BackColor = $cardBackground; $session.ForeColor = [System.Drawing.Color]::FromArgb(203, 213, 225)
+    $week = [System.Windows.Forms.Label]::new(); $week.Text = '7일 주간'; $week.Font = [System.Drawing.Font]::new('Segoe UI', 8, [System.Drawing.FontStyle]::Bold); $week.Location = [System.Drawing.Point]::new(18, 94); $week.AutoSize = $true; $week.BackColor = $cardBackground; $week.ForeColor = [System.Drawing.Color]::FromArgb(203, 213, 225)
     $sessionInfo = [System.Windows.Forms.Label]::new(); $sessionInfo.Location = [System.Drawing.Point]::new(18, 66); $sessionInfo.Size = [System.Drawing.Size]::new(135, 16); $sessionInfo.Font = [System.Drawing.Font]::new('Segoe UI', 8); $sessionInfo.ForeColor = [System.Drawing.Color]::FromArgb(148, 163, 184); $sessionInfo.BackColor = $cardBackground
     $sessionReset = [System.Windows.Forms.Label]::new(); $sessionReset.Location = [System.Drawing.Point]::new(158, 66); $sessionReset.Size = [System.Drawing.Size]::new(142, 16); $sessionReset.Font = [System.Drawing.Font]::new('Segoe UI', 8); $sessionReset.ForeColor = [System.Drawing.Color]::FromArgb(148, 163, 184); $sessionReset.BackColor = $cardBackground; $sessionReset.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
     $weekInfo = [System.Windows.Forms.Label]::new(); $weekInfo.Location = [System.Drawing.Point]::new(18, 118); $weekInfo.Size = [System.Drawing.Size]::new(135, 16); $weekInfo.Font = [System.Drawing.Font]::new('Segoe UI', 8); $weekInfo.ForeColor = [System.Drawing.Color]::FromArgb(148, 163, 184); $weekInfo.BackColor = $cardBackground
@@ -246,13 +435,13 @@ function New-UsageCard($title) {
 
 function Set-UsageCard($card, $result) {
     if ($result.error) {
-        $card.SessionInfo.Text = 'Unavailable'; $card.SessionReset.Text = $result.error
-        $card.WeekInfo.Text = 'Unavailable'; $card.WeekReset.Text = $result.error
+        $card.SessionInfo.Text = '불러올 수 없음'; $card.SessionReset.Text = $result.error
+        $card.WeekInfo.Text = '불러올 수 없음'; $card.WeekReset.Text = $result.error
         $card.Panel.Tag = [pscustomobject]@{ five = $null; seven = $null }; $card.Panel.Invalidate(); return
     }
     $fivePercent = Get-UsagePercent $result.five; $sevenPercent = Get-UsagePercent $result.seven
-    $card.SessionInfo.Text = "$(100 - $fivePercent)% remaining"; $card.SessionReset.Text = Get-ResetText $result.five
-    $card.WeekInfo.Text = "$(100 - $sevenPercent)% remaining"; $card.WeekReset.Text = Get-ResetText $result.seven -Weekly
+    $card.SessionInfo.Text = "$(100 - $fivePercent)% 남음"; $card.SessionReset.Text = Get-ResetText $result.five
+    $card.WeekInfo.Text = "$(100 - $sevenPercent)% 남음"; $card.WeekReset.Text = Get-ResetText $result.seven -Weekly
     $card.Panel.Tag = [pscustomobject]@{
         five = [pscustomobject]@{ Percent = $fivePercent; Color = Get-GaugeColor $fivePercent }
         seven = [pscustomobject]@{ Percent = $sevenPercent; Color = Get-GaugeColor $sevenPercent }
@@ -277,14 +466,15 @@ $xaml = @'
       <Border x:Name="ClaudeCard" Background="#172134" CornerRadius="16" Padding="16" Margin="0,0,0,10">
         <StackPanel><TextBlock Text="CLAUDE" Foreground="#E2E8F0" FontWeight="Bold" FontSize="12"/><TextBlock Text="5h session" Foreground="#CBD5E1" FontWeight="SemiBold" FontSize="11" Margin="0,14,0,5"/><Border Background="#334155" Height="8" CornerRadius="4"><Border x:Name="Claude5Fill" Background="#22C55E" Width="0" HorizontalAlignment="Left" CornerRadius="4"/></Border><Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock x:Name="Claude5Info" Foreground="#94A3B8" FontSize="11"/><TextBlock x:Name="Claude5Reset" Grid.Column="1" Foreground="#94A3B8" FontSize="11" HorizontalAlignment="Right"/></Grid><TextBlock Text="7d weekly" Foreground="#CBD5E1" FontWeight="SemiBold" FontSize="11" Margin="0,17,0,5"/><Border Background="#334155" Height="8" CornerRadius="4"><Border x:Name="Claude7Fill" Background="#22C55E" Width="0" HorizontalAlignment="Left" CornerRadius="4"/></Border><Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock x:Name="Claude7Info" Foreground="#94A3B8" FontSize="11"/><TextBlock x:Name="Claude7Reset" Grid.Column="1" Foreground="#94A3B8" FontSize="11" HorizontalAlignment="Right"/></Grid></StackPanel>
       </Border>
-      <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="8"/><ColumnDefinition/><ColumnDefinition Width="8"/><ColumnDefinition/></Grid.ColumnDefinitions><Border Background="#1E293B" CornerRadius="10"><Button x:Name="BadgeToggle" Content="Hide badge" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border><Border Grid.Column="2" Background="#1E293B" CornerRadius="10"><Button x:Name="Configure" Content="Configure" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border><Border Grid.Column="4" Background="#1E293B" CornerRadius="10"><Button x:Name="Exit" Content="Exit" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border></Grid>
+      <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="8"/><ColumnDefinition/><ColumnDefinition Width="8"/><ColumnDefinition/></Grid.ColumnDefinitions><Border Background="#1E293B" CornerRadius="10"><Button x:Name="WidgetToggle" Content="Hide widget" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border><Border Grid.Column="2" Background="#1E293B" CornerRadius="10"><Button x:Name="Configure" Content="Configure" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border><Border Grid.Column="4" Background="#1E293B" CornerRadius="10"><Button x:Name="Exit" Content="Exit" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border></Grid>
     </StackPanel>
   </Border>
 </Window>
 '@
+$xaml = $xaml.Replace('5h session', '5시간 세션').Replace('7d weekly', '7일 주간').Replace('Hide widget', '위젯 숨기기').Replace('Show widget', '위젯 보이기').Replace('Content="Configure"', 'Content="설정"').Replace('Content="Exit"', 'Content="종료"')
 $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
 $dashboard = [Windows.Markup.XamlReader]::Load($reader)
-$configure = $dashboard.FindName('Configure'); $exit = $dashboard.FindName('Exit'); $badgeToggle = $dashboard.FindName('BadgeToggle')
+$configure = $dashboard.FindName('Configure'); $exit = $dashboard.FindName('Exit'); $widgetToggle = $dashboard.FindName('WidgetToggle')
 
 $badgeXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Width="230" Height="54" WindowStyle="None" AllowsTransparency="True" Background="Transparent" ShowInTaskbar="False" Topmost="True" ResizeMode="NoResize">
@@ -301,17 +491,25 @@ $tray = [System.Windows.Forms.NotifyIcon]::new()
 $tray.Icon = New-DashboardTrayIcon
 $tray.Text = 'AI Usage Dashboard'
 $tray.Visible = $true
+$theme = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction SilentlyContinue
+$script:taskbarLightTheme = $theme.SystemUsesLightTheme -eq 1
+$script:taskbarOwner = [IntPtr]::Zero
+$taskbarWidget = [UsageTaskbarLayer]::new()
+$taskbarWidget.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$taskbarWidget.ShowInTaskbar = $false
+$taskbarWidget.TopMost = $true
+$taskbarWidget.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 
 function Set-WpfUsageCard($provider, $result) {
     $fiveInfo = $dashboard.FindName("${provider}5Info"); $fiveReset = $dashboard.FindName("${provider}5Reset"); $fiveFill = $dashboard.FindName("${provider}5Fill")
     $sevenInfo = $dashboard.FindName("${provider}7Info"); $sevenReset = $dashboard.FindName("${provider}7Reset"); $sevenFill = $dashboard.FindName("${provider}7Fill")
     if ($result.error) {
-        $fiveInfo.Text = 'Unavailable'; $fiveReset.Text = $result.error; $sevenInfo.Text = 'Unavailable'; $sevenReset.Text = $result.error
+        $fiveInfo.Text = '불러올 수 없음'; $fiveReset.Text = $result.error; $sevenInfo.Text = '불러올 수 없음'; $sevenReset.Text = $result.error
         $fiveFill.Width = 0; $sevenFill.Width = 0; return
     }
     $fivePercent = Get-UsagePercent $result.five; $sevenPercent = Get-UsagePercent $result.seven
-    $fiveInfo.Text = "$(100 - $fivePercent)% remaining"; $fiveReset.Text = Get-ResetText $result.five
-    $sevenInfo.Text = "$(100 - $sevenPercent)% remaining"; $sevenReset.Text = Get-ResetText $result.seven -Weekly
+    $fiveInfo.Text = "$(100 - $fivePercent)% 남음"; $fiveReset.Text = Get-ResetText $result.five
+    $sevenInfo.Text = "$(100 - $sevenPercent)% 남음"; $sevenReset.Text = Get-ResetText $result.seven -Weekly
     $fiveFill.Width = [Math]::Round(286 * $fivePercent / 100); $sevenFill.Width = [Math]::Round(286 * $sevenPercent / 100)
     $converter = [System.Windows.Media.BrushConverter]::new()
     $fiveFill.Background = $converter.ConvertFromString(('#{0:X2}{1:X2}{2:X2}' -f (Get-GaugeColor $fivePercent).R, (Get-GaugeColor $fivePercent).G, (Get-GaugeColor $fivePercent).B))
@@ -331,11 +529,11 @@ function Save-BadgePosition {
     $script:settings | ConvertTo-Json | Set-Content -LiteralPath $script:settingsFile -Encoding UTF8
 }
 
-function Set-BadgeEnabled($enabled) {
-    $script:settings | Add-Member -NotePropertyName showBadge -NotePropertyValue ([bool]$enabled) -Force
+function Set-TaskbarWidgetEnabled($enabled) {
+    $script:settings | Add-Member -NotePropertyName showTaskbarWidget -NotePropertyValue ([bool]$enabled) -Force
     $script:settings | ConvertTo-Json | Set-Content -LiteralPath $script:settingsFile -Encoding UTF8
-    $badgeToggle.Content = if ($enabled) { 'Hide badge' } else { 'Show badge' }
-    if ($enabled) { Update-UsageMenu } else { $usageBadge.Hide() }
+    $widgetToggle.Content = if ($enabled) { '위젯 숨기기' } else { '위젯 보이기' }
+    if ($enabled) { Update-UsageMenu } else { $taskbarWidget.Hide() }
 }
 
 function Set-TrayUsageDisplay($percent, $tooltip, $codexFive, $codexSeven, $claudeFive, $claudeSeven) {
@@ -344,27 +542,20 @@ function Set-TrayUsageDisplay($percent, $tooltip, $codexFive, $codexSeven, $clau
     $tray.Text = if ($tooltip.Length -le 63) { $tooltip } else { $tooltip.Substring(0, 63) }
     if ($oldIcon) { $oldIcon.Dispose() }
     if ($oldBitmap) { $oldBitmap.Dispose() }
-    $color = Get-GaugeColor $percent
-    $codexRow = $usageBadge.FindName('BadgeCodexRow'); $claudeRow = $usageBadge.FindName('BadgeClaudeRow')
-    $codexRow.Visibility = if ($null -ne $codexFive) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
-    $claudeRow.Visibility = if ($null -ne $claudeFive) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
-    if ($null -ne $codexFive) { Set-BadgeMetric ($usageBadge.FindName('BadgeCodex5')) ($usageBadge.FindName('BadgeCodex5Dot')) "5h $codexFive%" $codexFive; Set-BadgeMetric ($usageBadge.FindName('BadgeCodex7')) ($usageBadge.FindName('BadgeCodex7Dot')) "7d $codexSeven%" $codexSeven }
-    if ($null -ne $claudeFive) { Set-BadgeMetric ($usageBadge.FindName('BadgeClaude5')) ($usageBadge.FindName('BadgeClaude5Dot')) "5h $claudeFive%" $claudeFive; Set-BadgeMetric ($usageBadge.FindName('BadgeClaude7')) ($usageBadge.FindName('BadgeClaude7Dot')) "7d $claudeSeven%" $claudeSeven }
-    $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $usageBadge.Left = if ($script:settings.badgeLeft -ne $null) { [double]$script:settings.badgeLeft } else { $workArea.Right - $usageBadge.Width - 10 }
-    $usageBadge.Top = if ($script:settings.badgeTop -ne $null) { [double]$script:settings.badgeTop } else { $workArea.Bottom - $usageBadge.Height - 8 }
-    $badgeToggle.Content = if ($script:settings.showBadge -eq $false) { 'Show badge' } else { 'Hide badge' }
-    if ($script:settings.showBadge -ne $false -and -not $usageBadge.IsVisible) { $usageBadge.Show() }
+    $widgetToggle.Content = if (Test-TaskbarWidgetEnabled) { '위젯 숨기기' } else { '위젯 보이기' }
+    Set-TaskbarWidgetPosition
 }
 
 function Update-UsageMenu {
     $percentages = @(); $tooltipParts = @(); $codexFive = $null; $codexSeven = $null; $claudeFive = $null; $claudeSeven = $null
     if ($script:settings.showCodex) {
         $result = Get-Usage 'Codex'; Set-WpfUsageCard 'Codex' $result
+        $script:lastCodexResult = $result
         if (-not $result.error) { $five = Get-UsagePercent $result.five; $seven = Get-UsagePercent $result.seven; $percentages += $five, $seven; $tooltipParts += "Codex 5h:$five% 7d:$seven%"; $codexFive = $five; $codexSeven = $seven }
     }
     if ($script:settings.showClaude) {
         $result = Get-Usage 'Claude'; Set-WpfUsageCard 'Claude' $result
+        $script:lastClaudeResult = $result
         if (-not $result.error) { $five = Get-UsagePercent $result.five; $seven = Get-UsagePercent $result.seven; $percentages += $five, $seven; $tooltipParts += "Claude 5h:$five% 7d:$seven%"; $claudeFive = $five; $claudeSeven = $seven }
     }
     $highest = if ($percentages.Count) { ($percentages | Measure-Object -Maximum).Maximum } else { 0 }
@@ -378,11 +569,12 @@ function Apply-ProviderSelection {
 }
 
 $configure.Add_Click({ $dashboard.Hide(); Show-ProviderSetup; Apply-ProviderSelection; Update-UsageMenu })
-$badgeToggle.Add_Click({ Set-BadgeEnabled ($script:settings.showBadge -eq $false) })
-$badgeClose.Add_Click({ Set-BadgeEnabled $false })
+$widgetToggle.Add_Click({ Set-TaskbarWidgetEnabled (-not (Test-TaskbarWidgetEnabled)) })
 $exit.Add_Click({
     $timer.Stop()
-    $usageBadge.Close()
+    $taskbarTimer.Stop()
+    $taskbarWidget.Close()
+    if ($script:providerLogoCache) { foreach ($logo in $script:providerLogoCache.Values) { $logo.Dispose() } }
     $dashboard.Close()
     $tray.Visible = $false
     $tray.Dispose()
@@ -403,13 +595,16 @@ function Show-DashboardPopup {
 }
 $dashboard.Add_KeyDown({ param($sender, $event) if ($event.Key -eq [System.Windows.Input.Key]::Escape) { $sender.Hide() } })
 $dashboard.Add_Deactivated({ $dashboard.Hide() })
-$usageBadge.Add_MouseLeftButtonDown({ $usageBadge.DragMove(); Save-BadgePosition })
-$usageBadge.Add_MouseRightButtonUp({ Show-DashboardPopup })
+$taskbarWidget.Add_MouseClick({ param($sender, $event) if ($event.Button -eq [System.Windows.Forms.MouseButtons]::Right) { Show-DashboardPopup } })
 $tray.Add_MouseUp({ param($sender, $event) if ($event.Button -eq [System.Windows.Forms.MouseButtons]::Right) { Show-DashboardPopup } })
 $timer = [System.Windows.Forms.Timer]::new()
 $timer.Interval = $script:pollSeconds * 1000
 $timer.Add_Tick({ Update-UsageMenu })
 $timer.Start()
+$taskbarTimer = [System.Windows.Forms.Timer]::new()
+$taskbarTimer.Interval = 1000
+$taskbarTimer.Add_Tick({ Set-TaskbarWidgetPosition })
+$taskbarTimer.Start()
 Apply-ProviderSelection
 Update-UsageMenu
 [System.Windows.Forms.Application]::Run()
