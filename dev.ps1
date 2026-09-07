@@ -81,6 +81,10 @@ $script:settingsDir = Join-Path $env:LOCALAPPDATA 'AIUsageDashboard'
 $script:settingsFile = Join-Path $script:settingsDir 'settings.json'
 $script:settings = Get-JsonFile $script:settingsFile
 
+function Test-AppLightTheme {
+    return ($script:settings -and $script:settings.displayTheme -eq 'light')
+}
+
 function Test-ProviderLogin($provider) {
     if ($provider -eq 'Codex') {
         $auth = Get-JsonFile (Join-Path $UserDataRoot '.codex\auth.json')
@@ -128,7 +132,7 @@ function Get-ClaudeOAuth($userRoot) {
 
 function Save-ProviderSettings($codexEnabled, $claudeEnabled) {
     New-Item -ItemType Directory -Force -Path $script:settingsDir | Out-Null
-    [pscustomobject]@{ showCodex = [bool]$codexEnabled; showClaude = [bool]$claudeEnabled; showTaskbarWidget = if ($script:settings.showTaskbarWidget -ne $null) { [bool]$script:settings.showTaskbarWidget } else { $true } } | ConvertTo-Json | Set-Content -LiteralPath $script:settingsFile -Encoding UTF8
+    [pscustomobject]@{ showCodex = [bool]$codexEnabled; showClaude = [bool]$claudeEnabled; showTaskbarWidget = if ($script:settings.showTaskbarWidget -ne $null) { [bool]$script:settings.showTaskbarWidget } else { $true }; displayTheme = if (Test-AppLightTheme) { 'light' } else { 'dark' } } | ConvertTo-Json | Set-Content -LiteralPath $script:settingsFile -Encoding UTF8
     $script:settings = Get-JsonFile $script:settingsFile
 }
 
@@ -234,11 +238,11 @@ function Test-TaskbarWidgetEnabled {
 function Get-TaskbarWidgetWidth {
     $count = [int][bool]$script:settings.showCodex + [int][bool]$script:settings.showClaude
     if ($count -le 0) { return 0 }
-    # Keep a little breathing room around the compact taskbar readout.
-    return 214
+    if ($count -eq 1) { return 166 }
+    return 344
 }
 
-function Draw-ProviderIcon($graphics, $provider, $x, $y) {
+function Draw-ProviderIcon($graphics, $provider, $x, $y, $size) {
     if (-not $script:providerLogoCache) { $script:providerLogoCache = @{} }
     if (-not $script:providerLogoCache.ContainsKey($provider)) {
         $fileName = if ($provider -eq 'CLAUDE') { 'claude.png' } else { 'chatgpt.png' }
@@ -248,11 +252,23 @@ function Draw-ProviderIcon($graphics, $provider, $x, $y) {
             $source = [System.Drawing.Image]::FromFile($filePath)
             try {
                 $logo = [System.Drawing.Bitmap]::new($source)
-                # ChatGPT has a white background; Claude has a beige background
-                # just inside a nearly transparent edge pixel.
-                # Convert that background to alpha so only the logo is drawn on the taskbar.
-                $backgroundPixel = if ($provider -eq 'CLAUDE') { $logo.GetPixel(10, 10) } else { $logo.GetPixel(0, 0) }
-                $logo.MakeTransparent($backgroundPixel)
+                if ($provider -eq 'CODEX') {
+                    # Turn the black ChatGPT knot into a light alpha-only mark:
+                    # white source pixels become transparent, so no white tile is drawn.
+                    $foreground = if ($script:taskbarLightTheme) { [System.Drawing.Color]::FromArgb(15, 23, 42) } else { [System.Drawing.Color]::FromArgb(226, 232, 240) }
+                    for ($pixelY = 0; $pixelY -lt $logo.Height; $pixelY++) {
+                        for ($pixelX = 0; $pixelX -lt $logo.Width; $pixelX++) {
+                            $pixel = $logo.GetPixel($pixelX, $pixelY)
+                            $alpha = 255 - [int](($pixel.R + $pixel.G + $pixel.B) / 3)
+                            if ($alpha -eq 0) { $logo.SetPixel($pixelX, $pixelY, [System.Drawing.Color]::Transparent) }
+                            else { $logo.SetPixel($pixelX, $pixelY, [System.Drawing.Color]::FromArgb($alpha, $foreground.R, $foreground.G, $foreground.B)) }
+                        }
+                    }
+                } else {
+                    # Claude's actual flat app-icon background is beige, not the
+                    # nearly transparent corner pixel. Remove the beige field.
+                    $logo.MakeTransparent($logo.GetPixel(10, 10))
+                }
                 $script:providerLogoCache[$provider] = $logo
             } finally { $source.Dispose() }
         }
@@ -262,41 +278,36 @@ function Draw-ProviderIcon($graphics, $provider, $x, $y) {
     if ($icon) {
         $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
         if ($provider -eq 'CODEX') {
-            # The original ChatGPT icon has generous white padding. Crop it and
-            # place it on a white round chip so its black knot remains readable.
-            $chip = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(248, 250, 252))
-            try { $graphics.FillEllipse($chip, $x, $y + 1, 14, 14) } finally { $chip.Dispose() }
-            $graphics.DrawImage($icon, [System.Drawing.Rectangle]::new($x + 1, $y + 2, 12, 12), 40, 40, 176, 176, [System.Drawing.GraphicsUnit]::Pixel)
+            # Remove the source image's generous padding while retaining the knot shape.
+            $graphics.DrawImage($icon, [System.Drawing.Rectangle]::new($x, $y, $size, $size), 40, 40, 176, 176, [System.Drawing.GraphicsUnit]::Pixel)
         } else {
-            # Crop Claude's edge padding so the orange starburst is legible.
-            $graphics.DrawImage($icon, [System.Drawing.Rectangle]::new($x, $y + 1, 14, 14), 40, 40, 258, 258, [System.Drawing.GraphicsUnit]::Pixel)
+            $graphics.DrawImage($icon, [System.Drawing.Rectangle]::new($x, $y, $size, $size), 40, 40, 258, 258, [System.Drawing.GraphicsUnit]::Pixel)
         }
     }
 }
 
-function Draw-TaskbarUsageRow($graphics, $label, $result, $y, $x) {
+function Draw-TaskbarMetric($graphics, $period, $percent, $y, $x, $font, $textBrush, $trackColor) {
+    $graphics.DrawString("$period / " + $(if ($null -eq $percent) { '--' } else { "$percent%" }), $font, $textBrush, $x, $y)
+    $gaugeColor = if ($null -eq $percent) { [System.Drawing.Color]::FromArgb(100, 116, 139) } else { Get-GaugeColor $percent }
+    $track = [System.Drawing.Rectangle]::new($x + 65, $y + 6, 66, 6)
+    Draw-RoundedRectangle $graphics $trackColor $track 3
+    if ($null -ne $percent -and $percent -gt 0) {
+        $fillWidth = [Math]::Max(1, [Math]::Round($track.Width * $percent / 100))
+        Draw-RoundedRectangle $graphics $gaugeColor ([System.Drawing.Rectangle]::new($track.X, $track.Y, $fillWidth, $track.Height)) 3
+    }
+}
+
+function Draw-TaskbarProviderColumn($graphics, $provider, $result, $x, $y) {
     $textColor = if ($script:taskbarLightTheme) { [System.Drawing.Color]::FromArgb(31, 41, 55) } else { [System.Drawing.Color]::FromArgb(241, 245, 249) }
-    $valueFont = [System.Drawing.Font]::new('Segoe UI', 7)
+    $valueFont = [System.Drawing.Font]::new('Segoe UI Semibold', 8)
     $valueBrush = [System.Drawing.SolidBrush]::new($textColor)
     $five = $null; $seven = $null
     if ($result -and -not $result.error) { $five = Get-UsagePercent $result.five; $seven = Get-UsagePercent $result.seven }
-    Draw-ProviderIcon $graphics $label $x $y
-    $graphics.DrawString('5h', $valueFont, $valueBrush, $x + 28, $y)
-    $graphics.DrawString('/', $valueFont, $valueBrush, $x + 46, $y)
-    $graphics.DrawString($(if ($null -eq $five) { '--' } else { "$five%" }), $valueFont, $valueBrush, $x + 55, $y)
-    $fiveBrush = [System.Drawing.SolidBrush]::new($(if ($null -eq $five) { [System.Drawing.Color]::FromArgb(100, 116, 139) } else { Get-GaugeColor $five }))
     $trackColor = if ($script:taskbarLightTheme) { [System.Drawing.Color]::FromArgb(190, 190, 190) } else { [System.Drawing.Color]::FromArgb(71, 85, 105) }
-    $fiveTrack = [System.Drawing.Rectangle]::new($x + 78, $y + 5, 27, 5)
-    Draw-RoundedRectangle $graphics $trackColor $fiveTrack 3
-    if ($null -ne $five -and $five -gt 0) { Draw-RoundedRectangle $graphics $fiveBrush.Color ([System.Drawing.Rectangle]::new($fiveTrack.X, $fiveTrack.Y, [Math]::Max(1, [Math]::Round($fiveTrack.Width * $five / 100)), $fiveTrack.Height)) 3 }
-    $graphics.DrawString('7d', $valueFont, $valueBrush, $x + 111, $y)
-    $graphics.DrawString('/', $valueFont, $valueBrush, $x + 129, $y)
-    $graphics.DrawString($(if ($null -eq $seven) { '--' } else { "$seven%" }), $valueFont, $valueBrush, $x + 138, $y)
-    $sevenBrush = [System.Drawing.SolidBrush]::new($(if ($null -eq $seven) { [System.Drawing.Color]::FromArgb(100, 116, 139) } else { Get-GaugeColor $seven }))
-    $sevenTrack = [System.Drawing.Rectangle]::new($x + 161, $y + 5, 28, 5)
-    Draw-RoundedRectangle $graphics $trackColor $sevenTrack 3
-    if ($null -ne $seven -and $seven -gt 0) { Draw-RoundedRectangle $graphics $sevenBrush.Color ([System.Drawing.Rectangle]::new($sevenTrack.X, $sevenTrack.Y, [Math]::Max(1, [Math]::Round($sevenTrack.Width * $seven / 100)), $sevenTrack.Height)) 3 }
-    $sevenBrush.Dispose(); $fiveBrush.Dispose(); $valueBrush.Dispose(); $valueFont.Dispose()
+    Draw-ProviderIcon $graphics $provider $x ($y + 10) 17
+    Draw-TaskbarMetric $graphics '5h' $five $y ($x + 24) $valueFont $valueBrush $trackColor
+    Draw-TaskbarMetric $graphics '7d' $seven ($y + 20) ($x + 24) $valueFont $valueBrush $trackColor
+    $valueBrush.Dispose(); $valueFont.Dispose()
 }
 
 function Update-TaskbarWidgetBitmap($x, $y, $width, $height) {
@@ -305,9 +316,11 @@ function Update-TaskbarWidgetBitmap($x, $y, $width, $height) {
     try {
         $graphics.Clear([System.Drawing.Color]::FromArgb(1, 0, 0, 0))
         $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $rowY = 5
-        if ($script:settings.showCodex) { Draw-TaskbarUsageRow $graphics 'CODEX' $script:lastCodexResult $rowY 14; $rowY += 19 }
-        if ($script:settings.showClaude) { Draw-TaskbarUsageRow $graphics 'CLAUDE' $script:lastClaudeResult $rowY 14 }
+        if ($script:settings.showClaude) { Draw-TaskbarProviderColumn $graphics 'CLAUDE' $script:lastClaudeResult 10 2 }
+        if ($script:settings.showCodex) {
+            $codexX = if ($script:settings.showClaude) { 178 } else { 10 }
+            Draw-TaskbarProviderColumn $graphics 'CODEX' $script:lastCodexResult $codexX 2
+        }
         $taskbarWidget.SetBitmap($bitmap, $x, $y)
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
 }
@@ -475,6 +488,16 @@ $xaml = $xaml.Replace('5h session', '5시간 세션').Replace('7d weekly', '7일
 $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
 $dashboard = [Windows.Markup.XamlReader]::Load($reader)
 $configure = $dashboard.FindName('Configure'); $exit = $dashboard.FindName('Exit'); $widgetToggle = $dashboard.FindName('WidgetToggle')
+$buttonGrid = [System.Windows.Controls.Grid]$widgetToggle.Parent.Parent
+$buttonGrid.ColumnDefinitions.Add([System.Windows.Controls.ColumnDefinition]::new())
+$buttonGrid.ColumnDefinitions[5].Width = [System.Windows.GridLength]::new(8)
+$buttonGrid.ColumnDefinitions.Add([System.Windows.Controls.ColumnDefinition]::new())
+$themeToggle = [System.Windows.Controls.Button]::new()
+$themeToggle.Content = '라이트 모드'; $themeToggle.Background = [System.Windows.Media.Brushes]::Transparent; $themeToggle.BorderThickness = [System.Windows.Thickness]::new(0); $themeToggle.Height = 30; $themeToggle.FontSize = 10
+$themeButtonSurface = [System.Windows.Controls.Border]::new()
+$themeButtonSurface.Background = [System.Windows.Media.Brushes]::Transparent; $themeButtonSurface.CornerRadius = [System.Windows.CornerRadius]::new(10); $themeButtonSurface.Child = $themeToggle
+[System.Windows.Controls.Grid]::SetColumn($themeButtonSurface, 6)
+$null = $buttonGrid.Children.Add($themeButtonSurface)
 
 $badgeXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Width="230" Height="54" WindowStyle="None" AllowsTransparency="True" Background="Transparent" ShowInTaskbar="False" Topmost="True" ResizeMode="NoResize">
@@ -491,8 +514,7 @@ $tray = [System.Windows.Forms.NotifyIcon]::new()
 $tray.Icon = New-DashboardTrayIcon
 $tray.Text = 'AI Usage Dashboard'
 $tray.Visible = $true
-$theme = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction SilentlyContinue
-$script:taskbarLightTheme = $theme.SystemUsesLightTheme -eq 1
+$script:taskbarLightTheme = Test-AppLightTheme
 $script:taskbarOwner = [IntPtr]::Zero
 $taskbarWidget = [UsageTaskbarLayer]::new()
 $taskbarWidget.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
@@ -546,6 +568,48 @@ function Set-TrayUsageDisplay($percent, $tooltip, $codexFive, $codexSeven, $clau
     Set-TaskbarWidgetPosition
 }
 
+function Set-DashboardThemeChildren($root, $textBrush, $mutedBrush, $trackBrush) {
+    $childCount = [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($root)
+    for ($index = 0; $index -lt $childCount; $index++) {
+        $child = [System.Windows.Media.VisualTreeHelper]::GetChild($root, $index)
+        if ($child -is [System.Windows.Controls.TextBlock]) {
+            $child.Foreground = if ($child.Name -match '(Info|Reset)$') { $mutedBrush } else { $textBrush }
+        } elseif ($child -is [System.Windows.Controls.Button]) {
+            $child.Foreground = $textBrush
+        } elseif ($child -is [System.Windows.Controls.Border] -and $child.Height -eq 8 -and $child.Name -notmatch 'Fill$') {
+            $child.Background = $trackBrush
+        }
+        Set-DashboardThemeChildren $child $textBrush $mutedBrush $trackBrush
+    }
+}
+
+function Apply-AppTheme {
+    $isLight = Test-AppLightTheme
+    $converter = [System.Windows.Media.BrushConverter]::new()
+    $shellBrush = $converter.ConvertFromString($(if ($isLight) { '#F8FAFC' } else { '#0B1220' }))
+    $cardBrush = $converter.ConvertFromString($(if ($isLight) { '#FFFFFF' } else { '#172134' }))
+    $buttonBrush = $converter.ConvertFromString($(if ($isLight) { '#E2E8F0' } else { '#1E293B' }))
+    $textBrush = $converter.ConvertFromString($(if ($isLight) { '#0F172A' } else { '#E2E8F0' }))
+    $mutedBrush = $converter.ConvertFromString($(if ($isLight) { '#475569' } else { '#94A3B8' }))
+    $trackBrush = $converter.ConvertFromString($(if ($isLight) { '#CBD5E1' } else { '#334155' }))
+    $dashboard.FindName('Shell').Background = $shellBrush
+    $dashboard.FindName('CodexCard').Background = $cardBrush
+    $dashboard.FindName('ClaudeCard').Background = $cardBrush
+    foreach ($button in @($widgetToggle, $configure, $exit, $themeToggle)) { $button.Parent.Background = $buttonBrush }
+    Set-DashboardThemeChildren $dashboard $textBrush $mutedBrush $trackBrush
+    $themeToggle.Content = if ($isLight) { '다크 모드' } else { '라이트 모드' }
+}
+
+function Set-AppTheme($themeMode) {
+    $script:settings | Add-Member -NotePropertyName displayTheme -NotePropertyValue $themeMode -Force
+    $script:settings | ConvertTo-Json | Set-Content -LiteralPath $script:settingsFile -Encoding UTF8
+    $script:taskbarLightTheme = Test-AppLightTheme
+    if ($script:providerLogoCache) { foreach ($logo in $script:providerLogoCache.Values) { $logo.Dispose() } }
+    $script:providerLogoCache = @{}
+    Apply-AppTheme
+    Update-UsageMenu
+}
+
 function Update-UsageMenu {
     $percentages = @(); $tooltipParts = @(); $codexFive = $null; $codexSeven = $null; $claudeFive = $null; $claudeSeven = $null
     if ($script:settings.showCodex) {
@@ -570,6 +634,7 @@ function Apply-ProviderSelection {
 
 $configure.Add_Click({ $dashboard.Hide(); Show-ProviderSetup; Apply-ProviderSelection; Update-UsageMenu })
 $widgetToggle.Add_Click({ Set-TaskbarWidgetEnabled (-not (Test-TaskbarWidgetEnabled)) })
+$themeToggle.Add_Click({ Set-AppTheme $(if (Test-AppLightTheme) { 'dark' } else { 'light' }) })
 $exit.Add_Click({
     $timer.Stop()
     $taskbarTimer.Stop()
@@ -605,6 +670,7 @@ $taskbarTimer = [System.Windows.Forms.Timer]::new()
 $taskbarTimer.Interval = 1000
 $taskbarTimer.Add_Tick({ Set-TaskbarWidgetPosition })
 $taskbarTimer.Start()
+Apply-AppTheme
 Apply-ProviderSelection
 Update-UsageMenu
 [System.Windows.Forms.Application]::Run()
