@@ -1,6 +1,6 @@
 # AI Usage Dashboard for Windows
 
-현재 배포 버전: **v1.0.2**
+현재 배포 버전: **v1.0.3**
 
 Codex와 Claude Code의 구독형 사용량을 Windows 시스템 트레이와 작업표시줄 사용량 위젯에서 확인하는 작은 도구입니다. 트레이 아이콘이나 작업표시줄 위젯을 우클릭하면 둥근 상세 대시보드가 열립니다.
 
@@ -25,7 +25,7 @@ Codex와 Claude Code의 구독형 사용량을 Windows 시스템 트레이와 �
 
 최신 배포본은 아래 링크에서 받을 수 있습니다.
 
-[AI Usage Dashboard v1.0.2 ZIP 다운로드](https://github.com/LeeKyuHwan1234/usage/releases/latest/download/AI-Usage-Dashboard-v1.0.2.zip)
+[AI Usage Dashboard v1.0.3 ZIP 다운로드](https://github.com/LeeKyuHwan1234/usage/releases/latest/download/AI-Usage-Dashboard-v1.0.3.zip)
 
 ZIP 파일을 압축 해제한 뒤 `AI Usage Dashboard.vbs`를 더블클릭하세요.
 
