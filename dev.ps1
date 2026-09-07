@@ -167,10 +167,45 @@ function Show-ProviderSetup {
     if (-not $script:settings) { Save-ProviderSettings $codexBox.Checked $claudeBox.Checked }
 }
 
+function Get-RetryDelaySeconds($errorRecord) {
+    $statusCode = $null; $retryAfter = $null
+    try {
+        $response = $errorRecord.Exception.Response
+        if ($response) {
+            $statusCode = [int]$response.StatusCode
+            try { $retryAfter = $response.Headers['Retry-After'] } catch { }
+            if (-not $retryAfter) {
+                try {
+                    if ($response.Headers.RetryAfter.Delta) { $retryAfter = [Math]::Ceiling($response.Headers.RetryAfter.Delta.TotalSeconds) }
+                    elseif ($response.Headers.RetryAfter.Date) { $retryAfter = [Math]::Ceiling(($response.Headers.RetryAfter.Date.LocalDateTime - (Get-Date)).TotalSeconds) }
+                } catch { }
+            }
+        }
+    } catch { }
+    $seconds = 0
+    if ($retryAfter) {
+        if (-not [int]::TryParse([string]$retryAfter, [ref]$seconds)) {
+            $retryAt = [DateTimeOffset]::MinValue
+            if ([DateTimeOffset]::TryParse([string]$retryAfter, [ref]$retryAt)) { $seconds = [Math]::Ceiling(($retryAt.LocalDateTime - (Get-Date)).TotalSeconds) }
+        }
+    }
+    # Never retry faster than the dashboard's five-minute poll interval.
+    # A longer server-provided Retry-After value extends that delay.
+    if ($seconds -gt 0) { return [Math]::Max($script:pollSeconds, [Math]::Min(86400, $seconds)) }
+    return $script:pollSeconds
+}
+
 function Get-Usage($provider) {
+    $now = Get-Date
     $cached = $script:usageCache[$provider]
-    if ($cached -and (((Get-Date) - $cached.fetchedAt).TotalSeconds -lt $script:pollSeconds)) {
-        return $cached.value
+    if ($cached) {
+        if ($cached.nextRetryAt -and $now -lt $cached.nextRetryAt) {
+            if ($cached.value) { return $cached.value }
+            return @{ error = $cached.error }
+        }
+        if ($cached.value -and $cached.fetchedAt -and (($now - $cached.fetchedAt).TotalSeconds -lt $script:pollSeconds)) {
+            return $cached.value
+        }
     }
     if ($provider -eq 'Claude') {
         $auth = Get-ClaudeOAuth $UserDataRoot
@@ -188,12 +223,21 @@ function Get-Usage($provider) {
         $raw = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 15
         if ($provider -eq 'Codex') { $result = @{ five = $raw.rate_limit.primary_window; seven = $raw.rate_limit.secondary_window } }
         else { $result = @{ five = $raw.five_hour; seven = $raw.seven_day } }
-        $script:usageCache[$provider] = @{ value = $result; fetchedAt = Get-Date }
+        $script:usageCache[$provider] = @{ value = $result; fetchedAt = $now; nextRetryAt = $null; error = $null }
         return $result
     } catch {
-        # Keep showing the last successful value instead of repeatedly retrying after a rate limit.
-        if ($cached) { return $cached.value }
-        return @{ error = "request failed: $($_.Exception.Message)" }
+        # Retain the last successful value, but also suppress further HTTP calls
+        # until the server's Retry-After period (or a conservative fallback) ends.
+        $message = "request failed: $($_.Exception.Message)"
+        $retryAt = $now.AddSeconds((Get-RetryDelaySeconds $_))
+        if ($cached) {
+            $cached.nextRetryAt = $retryAt; $cached.error = $message
+            $script:usageCache[$provider] = $cached
+            if ($cached.value) { return $cached.value }
+        } else {
+            $script:usageCache[$provider] = @{ value = $null; fetchedAt = $null; nextRetryAt = $retryAt; error = $message }
+        }
+        return @{ error = $message }
     }
 }
 
