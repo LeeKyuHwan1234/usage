@@ -1,6 +1,6 @@
 # AI Usage Dashboard for Windows
 
-현재 배포 버전: **v1.0.3**
+현재 배포 버전: **v1.0.4**
 
 Codex와 Claude Code의 구독형 사용량을 Windows 시스템 트레이와 작업표시줄 사용량 위젯에서 확인하는 작은 도구입니다. 트레이 아이콘이나 작업표시줄 위젯을 우클릭하면 둥근 상세 대시보드가 열립니다.
 
@@ -13,7 +13,7 @@ Codex와 Claude Code의 구독형 사용량을 Windows 시스템 트레이와 �
 - 트레이 아이콘: 5h·7d 중 가장 높은 사용률을 원형 게이지와 색상으로 표시
 - 작업표시줄 위젯: 알림 영역 바로 왼쪽에 실제로 고정되며, ChatGPT·Claude 아이콘과 5h·7d 사용률 게이지 표시
 - 상세 대시보드: 한국어 UI로 세션/주간 사용량, 남은 비율, 초기화 시각을 둥근 카드 형태로 표시
-- 다크/라이트 모드: 기본 다크 모드이며, 상세 대시보드에서 즉시 전환하고 선택값을 저장
+- 분리된 다크/라이트 모드: 창 모드는 설정 창·상세 대시보드에, 위젯 모드는 작업표시줄 위젯에 각각 적용
 - 원격 서비스 호출은 성공·실패 모두 최소 5분 간격으로 제한하고, 마지막 정상 값을 유지
 - 429 응답의 `Retry-After`가 5분보다 길면 해당 시간까지 재시도를 미룸
 - Claude Code 로그인 토큰이 만료되면 저장된 갱신 토큰으로 자동 갱신 시도
@@ -25,7 +25,7 @@ Codex와 Claude Code의 구독형 사용량을 Windows 시스템 트레이와 �
 
 최신 배포본은 아래 링크에서 받을 수 있습니다.
 
-[AI Usage Dashboard v1.0.3 ZIP 다운로드](https://github.com/LeeKyuHwan1234/usage/releases/latest/download/AI-Usage-Dashboard-v1.0.3.zip)
+[AI Usage Dashboard v1.0.4 ZIP 다운로드](https://github.com/LeeKyuHwan1234/usage/releases/latest/download/AI-Usage-Dashboard-v1.0.4.zip)
 
 ZIP 파일을 압축 해제한 뒤 `AI Usage Dashboard.vbs`를 더블클릭하세요.
 
@@ -80,7 +80,8 @@ codex login --device-auth
 
 - `설정`: Codex / Claude 표시 여부 변경
 - `위젯 숨기기` / `위젯 보이기`: 작업표시줄 위젯을 숨기거나 다시 표시
-- `라이트 모드` / `다크 모드`: 대시보드와 작업표시줄 위젯의 색상 모드 전환
+- `창 라이트` / `창 다크`: 설정 창과 상세 대시보드의 색상 모드 전환
+- `위젯 라이트` / `위젯 다크`: 작업표시줄 위젯의 색상 모드 전환
 - `종료`: 프로그램 완전 종료
 
 숨긴 작업표시줄 위젯은 트레이 아이콘을 우클릭해 대시보드를 연 뒤 `위젯 보이기`로 다시 표시할 수 있습니다.
