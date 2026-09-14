@@ -1,6 +1,6 @@
 # AI Usage Dashboard for Windows
 
-현재 배포 버전: **v1.0.4**
+현재 배포 버전: **v1.0.5**
 
 Codex와 Claude Code의 구독형 사용량을 Windows 시스템 트레이와 작업표시줄 사용량 위젯에서 확인하는 작은 도구입니다. 트레이 아이콘이나 작업표시줄 위젯을 우클릭하면 둥근 상세 대시보드가 열립니다.
 
@@ -15,6 +15,7 @@ Codex와 Claude Code의 구독형 사용량을 Windows 시스템 트레이와 �
 - 상세 대시보드: 한국어 UI로 세션/주간 사용량, 남은 비율, 초기화 시각을 둥근 카드 형태로 표시
 - 분리된 다크/라이트 모드: 창 모드는 설정 창·상세 대시보드에, 위젯 모드는 작업표시줄 위젯에 각각 적용
 - 원격 서비스 호출은 성공·실패 모두 최소 5분 간격으로 제한하고, 마지막 정상 값을 유지
+- 상세 창의 **강제 새로고침**은 정상 캐시만 건너뛰어 즉시 최신 사용량을 조회 (서버의 429 재시도 대기는 준수)
 - 429 응답의 `Retry-After`가 5분보다 길면 해당 시간까지 재시도를 미룸
 - Claude Code 로그인 토큰이 만료되면 저장된 갱신 토큰으로 자동 갱신 시도
 - 일반 실행은 사용자당 하나만 허용 (중복 실행 시 안내 표시)
@@ -25,7 +26,11 @@ Codex와 Claude Code의 구독형 사용량을 Windows 시스템 트레이와 �
 
 최신 배포본은 아래 링크에서 받을 수 있습니다.
 
-[AI Usage Dashboard v1.0.4 ZIP 다운로드](https://github.com/LeeKyuHwan1234/usage/releases/latest/download/AI-Usage-Dashboard-v1.0.4.zip)
+[AI Usage Dashboard v1.0.5 EXE 다운로드](https://github.com/LeeKyuHwan1234/usage/releases/latest/download/AI-Usage-Dashboard-v1.0.5.exe)
+
+EXE는 더블클릭하면 바로 실행됩니다. 별도 설치는 필요 없으며 필요한 파일은 사용자 로컬 앱 폴더에 자동 준비됩니다.
+
+[AI Usage Dashboard v1.0.5 ZIP 다운로드](https://github.com/LeeKyuHwan1234/usage/releases/latest/download/AI-Usage-Dashboard-v1.0.5.zip)
 
 ZIP 파일을 압축 해제한 뒤 `AI Usage Dashboard.vbs`를 더블클릭하세요.
 
@@ -110,7 +115,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ## 다른 사람에게 공유하기
 
-이 저장소의 최신 Release ZIP(또는 폴더 전체)을 전달하세요. 받는 사람은 압축을 풀고 `AI Usage Dashboard.vbs`를 더블클릭하면 됩니다. `assets` 폴더도 반드시 함께 포함되어야 작업표시줄 아이콘이 정상 표시됩니다. Release ZIP에는 이 폴더가 포함되어 있습니다.
+이 저장소의 최신 Release EXE 또는 ZIP을 전달하세요. EXE는 더블클릭으로 바로 실행할 수 있습니다. ZIP을 전달할 때는 압축을 풀고 `AI Usage Dashboard.vbs`를 더블클릭하면 됩니다. `assets` 폴더도 반드시 함께 포함되어야 작업표시줄 아이콘이 정상 표시됩니다. Release ZIP에는 이 폴더가 포함되어 있습니다.
 
 각 사용자는 자신의 Windows 계정으로 Codex와 Claude Code에 로그인해야 합니다. 이 도구는 실행한 사용자의 `%USERPROFILE%\.codex` 및 `%USERPROFILE%\.claude` 경로를 자동으로 사용합니다.
 

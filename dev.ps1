@@ -205,7 +205,7 @@ function Get-RetryDelaySeconds($errorRecord) {
     return $script:pollSeconds
 }
 
-function Get-Usage($provider) {
+function Get-Usage($provider, [switch]$ForceRefresh) {
     $now = Get-Date
     $cached = $script:usageCache[$provider]
     if ($cached) {
@@ -213,7 +213,9 @@ function Get-Usage($provider) {
             if ($cached.value) { return $cached.value }
             return @{ error = $cached.error }
         }
-        if ($cached.value -and $cached.fetchedAt -and (($now - $cached.fetchedAt).TotalSeconds -lt $script:pollSeconds)) {
+        # Manual refresh bypasses only a successful-data cache. A server-directed
+        # backoff (nextRetryAt) above is always respected to avoid retry floods.
+        if (-not $ForceRefresh -and $cached.value -and $cached.fetchedAt -and (($now - $cached.fetchedAt).TotalSeconds -lt $script:pollSeconds)) {
             return $cached.value
         }
     }
@@ -524,7 +526,7 @@ $background = [System.Drawing.Color]::FromArgb(11, 18, 32)
 $surface = [System.Drawing.Color]::FromArgb(30, 41, 59)
 $text = [System.Drawing.Color]::FromArgb(226, 232, 240)
 $xaml = @'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Width="350" Height="420" WindowStyle="None" AllowsTransparency="True" Background="Transparent" ShowInTaskbar="False" Topmost="True" ResizeMode="NoResize">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Width="350" Height="458" WindowStyle="None" AllowsTransparency="True" Background="Transparent" ShowInTaskbar="False" Topmost="True" ResizeMode="NoResize">
   <Border x:Name="Shell" Background="#0B1220" CornerRadius="20" Padding="12">
     <StackPanel>
       <Border x:Name="CodexCard" Background="#172134" CornerRadius="16" Padding="16" Margin="0,0,0,10">
@@ -533,6 +535,7 @@ $xaml = @'
       <Border x:Name="ClaudeCard" Background="#172134" CornerRadius="16" Padding="16" Margin="0,0,0,10">
         <StackPanel><TextBlock Text="CLAUDE" Foreground="#E2E8F0" FontWeight="Bold" FontSize="12"/><TextBlock Text="5h session" Foreground="#CBD5E1" FontWeight="SemiBold" FontSize="11" Margin="0,14,0,5"/><Border Background="#334155" Height="8" CornerRadius="4"><Border x:Name="Claude5Fill" Background="#22C55E" Width="0" HorizontalAlignment="Left" CornerRadius="4"/></Border><Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock x:Name="Claude5Info" Foreground="#94A3B8" FontSize="11"/><TextBlock x:Name="Claude5Reset" Grid.Column="1" Foreground="#94A3B8" FontSize="11" HorizontalAlignment="Right"/></Grid><TextBlock Text="7d weekly" Foreground="#CBD5E1" FontWeight="SemiBold" FontSize="11" Margin="0,17,0,5"/><Border Background="#334155" Height="8" CornerRadius="4"><Border x:Name="Claude7Fill" Background="#22C55E" Width="0" HorizontalAlignment="Left" CornerRadius="4"/></Border><Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock x:Name="Claude7Info" Foreground="#94A3B8" FontSize="11"/><TextBlock x:Name="Claude7Reset" Grid.Column="1" Foreground="#94A3B8" FontSize="11" HorizontalAlignment="Right"/></Grid></StackPanel>
       </Border>
+      <Border Background="#1E293B" CornerRadius="10" Margin="0,0,0,8"><Button x:Name="ForceRefresh" Content="강제 새로고침" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border>
       <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="8"/><ColumnDefinition/><ColumnDefinition Width="8"/><ColumnDefinition/></Grid.ColumnDefinitions><Border Background="#1E293B" CornerRadius="10"><Button x:Name="WidgetToggle" Content="Hide widget" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border><Border Grid.Column="2" Background="#1E293B" CornerRadius="10"><Button x:Name="Configure" Content="Configure" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border><Border Grid.Column="4" Background="#1E293B" CornerRadius="10"><Button x:Name="Exit" Content="Exit" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border></Grid>
     </StackPanel>
   </Border>
@@ -541,7 +544,7 @@ $xaml = @'
 $xaml = $xaml.Replace('5h session', '5시간 세션').Replace('7d weekly', '7일 주간').Replace('Hide widget', '위젯 숨기기').Replace('Show widget', '위젯 보이기').Replace('Content="Configure"', 'Content="설정"').Replace('Content="Exit"', 'Content="종료"')
 $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
 $dashboard = [Windows.Markup.XamlReader]::Load($reader)
-$configure = $dashboard.FindName('Configure'); $exit = $dashboard.FindName('Exit'); $widgetToggle = $dashboard.FindName('WidgetToggle')
+$configure = $dashboard.FindName('Configure'); $exit = $dashboard.FindName('Exit'); $widgetToggle = $dashboard.FindName('WidgetToggle'); $forceRefresh = $dashboard.FindName('ForceRefresh')
 $buttonGrid = [System.Windows.Controls.Grid]$widgetToggle.Parent.Parent
 $buttonGrid.ColumnDefinitions.Add([System.Windows.Controls.ColumnDefinition]::new())
 $buttonGrid.ColumnDefinitions[5].Width = [System.Windows.GridLength]::new(8)
@@ -684,15 +687,15 @@ function Set-WidgetTheme($themeMode) {
     Set-TaskbarWidgetPosition
 }
 
-function Update-UsageMenu {
+function Update-UsageMenu([switch]$ForceRefresh) {
     $percentages = @(); $tooltipParts = @(); $codexFive = $null; $codexSeven = $null; $claudeFive = $null; $claudeSeven = $null
     if ($script:settings.showCodex) {
-        $result = Get-Usage 'Codex'; Set-WpfUsageCard 'Codex' $result
+        $result = Get-Usage 'Codex' -ForceRefresh:$ForceRefresh; Set-WpfUsageCard 'Codex' $result
         $script:lastCodexResult = $result
         if (-not $result.error) { $five = Get-UsagePercent $result.five; $seven = Get-UsagePercent $result.seven; $percentages += $five, $seven; $tooltipParts += "Codex 5h:$five% 7d:$seven%"; $codexFive = $five; $codexSeven = $seven }
     }
     if ($script:settings.showClaude) {
-        $result = Get-Usage 'Claude'; Set-WpfUsageCard 'Claude' $result
+        $result = Get-Usage 'Claude' -ForceRefresh:$ForceRefresh; Set-WpfUsageCard 'Claude' $result
         $script:lastClaudeResult = $result
         if (-not $result.error) { $five = Get-UsagePercent $result.five; $seven = Get-UsagePercent $result.seven; $percentages += $five, $seven; $tooltipParts += "Claude 5h:$five% 7d:$seven%"; $claudeFive = $five; $claudeSeven = $seven }
     }
@@ -707,6 +710,10 @@ function Apply-ProviderSelection {
 }
 
 $configure.Add_Click({ $dashboard.Hide(); Show-ProviderSetup; Apply-ProviderSelection; Update-UsageMenu })
+$forceRefresh.Add_Click({
+    $forceRefresh.IsEnabled = $false; $forceRefresh.Content = '새로고침 중...'
+    try { Update-UsageMenu -ForceRefresh } finally { $forceRefresh.Content = '강제 새로고침'; $forceRefresh.IsEnabled = $true }
+})
 $widgetToggle.Add_Click({ Set-TaskbarWidgetEnabled (-not (Test-TaskbarWidgetEnabled)) })
 $themeToggle.Add_Click({ Set-WindowTheme $(if (Test-WindowLightTheme) { 'dark' } else { 'light' }) })
 $widgetThemeToggle.Add_Click({ Set-WidgetTheme $(if (Test-WidgetLightTheme) { 'dark' } else { 'light' }) })
