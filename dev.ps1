@@ -107,34 +107,67 @@ function Get-ProviderSetupMessage($provider) {
     if ($provider -eq 'Codex') {
         return 'Setup required: run codex login with your ChatGPT account.'
     }
-    return 'Setup required: open Claude Code and sign in to Claude.ai.'
+    return 'Claude 로그인 정보가 없습니다. Claude Code를 실행한 뒤 /login으로 다시 로그인하세요.'
+}
+
+function Get-HttpStatusCode($errorRecord) {
+    try {
+        if ($errorRecord.Exception.Response -and $errorRecord.Exception.Response.StatusCode) {
+            return [int]$errorRecord.Exception.Response.StatusCode
+        }
+    } catch { }
+    return 0
+}
+
+function Get-ClaudeRequestFailureMessage($errorRecord, $operation) {
+    $statusCode = Get-HttpStatusCode $errorRecord
+    if ($statusCode -in @(400, 401, 403)) {
+        return "Claude $operation 요청이 거부되었습니다. Claude Code에서 /logout 후 /login으로 다시 로그인하세요."
+    }
+    if ($statusCode -eq 429) {
+        return "Claude $operation 요청이 일시적으로 제한되었습니다(429). 잠시 후 다시 시도하세요."
+    }
+    if ($statusCode -gt 0) {
+        return "Claude $operation 요청이 서버 오류로 실패했습니다(HTTP $statusCode). 잠시 후 다시 시도하세요."
+    }
+    return "Claude $operation 요청에 연결하지 못했습니다. 인터넷 연결 또는 Claude 서비스 상태를 확인하세요."
 }
 
 function Get-ClaudeOAuth($userRoot) {
     $credentialPath = Join-Path $userRoot '.claude\.credentials.json'
+    if (-not (Test-Path -LiteralPath $credentialPath)) { return @{ error = Get-ProviderSetupMessage 'Claude' } }
     $credential = Get-JsonFile $credentialPath
+    if (-not $credential) { return @{ error = 'Claude 로그인 정보를 읽지 못했습니다. Claude Code에서 /logout 후 /login으로 다시 로그인하세요.' } }
     $oauth = $credential.claudeAiOauth
-    if (-not $oauth.accessToken) { return @{ error = Get-ProviderSetupMessage 'Claude' } }
+    if (-not $oauth.accessToken) { return @{ error = 'Claude 로그인 정보에 액세스 토큰이 없습니다. Claude Code에서 /login으로 로그인하세요.' } }
 
     # Claude Code OAuth access tokens are short-lived. Refresh before use when expired or nearly expired.
     $expiresAt = if ($oauth.expiresAt) { [int64]$oauth.expiresAt } else { 0 }
     if ($expiresAt -gt 0 -and $expiresAt -le ([DateTimeOffset]::Now.ToUnixTimeMilliseconds() + 120000)) {
-        if (-not $oauth.refreshToken) { return @{ error = 'Claude session expired. Run claude auth login.' } }
+        if (-not $oauth.refreshToken) { return @{ error = 'Claude 액세스 토큰이 만료되었고 자동 갱신용 refresh token이 없습니다. Claude Code에서 /login으로 다시 로그인하세요.' } }
         $body = @{ grant_type = 'refresh_token'; refresh_token = $oauth.refreshToken; client_id = '9d1c250a-e61b-44d9-88ed-5944d1962f5e' } | ConvertTo-Json -Compress
         $refreshError = $null; $refreshed = $null
         foreach ($endpoint in @('https://platform.claude.com/v1/oauth/token', 'https://console.anthropic.com/v1/oauth/token')) {
             try {
                 $refreshed = Invoke-RestMethod -Method Post -Uri $endpoint -ContentType 'application/json' -Headers @{ Accept = 'application/json'; 'User-Agent' = 'ai-usage-dashboard-local' } -Body $body -TimeoutSec 15
                 if ($refreshed.access_token) { break }
-            } catch { $refreshError = $_.Exception.Message }
+            } catch { $refreshError = Get-ClaudeRequestFailureMessage $_ '로그인 토큰 갱신' }
         }
-        if (-not $refreshed.access_token) { return @{ error = "Claude session refresh failed: $refreshError" } }
+        if (-not $refreshed.access_token) {
+            if (-not $refreshError) { $refreshError = 'Claude 로그인 토큰 갱신 응답에 새 액세스 토큰이 없습니다. Claude Code에서 /login으로 다시 로그인하세요.' }
+            return @{ error = $refreshError }
+        }
         $oauth.accessToken = $refreshed.access_token
         if ($refreshed.refresh_token) { $oauth.refreshToken = $refreshed.refresh_token }
         if ($refreshed.expires_in) { $oauth.expiresAt = [DateTimeOffset]::Now.ToUnixTimeMilliseconds() + ([int64]$refreshed.expires_in * 1000) }
         elseif ($refreshed.expires_at) { $oauth.expiresAt = [int64]$refreshed.expires_at }
         $credential.claudeAiOauth = $oauth
-        $credential | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $credentialPath -Encoding UTF8
+        try {
+            $credential | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $credentialPath -Encoding UTF8 -ErrorAction Stop
+            return @{ accessToken = $oauth.accessToken; status = 'Claude 로그인 토큰을 자동으로 갱신했습니다.' }
+        } catch {
+            return @{ accessToken = $oauth.accessToken; status = 'Claude 로그인 토큰은 자동 갱신됐지만 저장에 실패했습니다. 다음 실행 때 다시 로그인해야 할 수 있습니다.' }
+        }
     }
     return $oauth
 }
@@ -234,13 +267,13 @@ function Get-Usage($provider, [switch]$ForceRefresh) {
     try {
         $raw = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 15
         if ($provider -eq 'Codex') { $result = @{ five = $raw.rate_limit.primary_window; seven = $raw.rate_limit.secondary_window } }
-        else { $result = @{ five = $raw.five_hour; seven = $raw.seven_day } }
+        else { $result = @{ five = $raw.five_hour; seven = $raw.seven_day; status = $auth.status } }
         $script:usageCache[$provider] = @{ value = $result; fetchedAt = $now; nextRetryAt = $null; error = $null }
         return $result
     } catch {
         # Retain the last successful value, but also suppress further HTTP calls
         # until the server's Retry-After period (or a conservative fallback) ends.
-        $message = "request failed: $($_.Exception.Message)"
+        $message = if ($provider -eq 'Claude') { Get-ClaudeRequestFailureMessage $_ '사용량 조회' } else { "request failed: $($_.Exception.Message)" }
         $retryAt = $now.AddSeconds((Get-RetryDelaySeconds $_))
         if ($cached) {
             $cached.nextRetryAt = $retryAt; $cached.error = $message
@@ -526,7 +559,7 @@ $background = [System.Drawing.Color]::FromArgb(11, 18, 32)
 $surface = [System.Drawing.Color]::FromArgb(30, 41, 59)
 $text = [System.Drawing.Color]::FromArgb(226, 232, 240)
 $xaml = @'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Width="350" Height="458" WindowStyle="None" AllowsTransparency="True" Background="Transparent" ShowInTaskbar="False" Topmost="True" ResizeMode="NoResize">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Width="350" Height="492" WindowStyle="None" AllowsTransparency="True" Background="Transparent" ShowInTaskbar="False" Topmost="True" ResizeMode="NoResize">
   <Border x:Name="Shell" Background="#0B1220" CornerRadius="20" Padding="12">
     <StackPanel>
       <Border x:Name="CodexCard" Background="#172134" CornerRadius="16" Padding="16" Margin="0,0,0,10">
@@ -535,6 +568,7 @@ $xaml = @'
       <Border x:Name="ClaudeCard" Background="#172134" CornerRadius="16" Padding="16" Margin="0,0,0,10">
         <StackPanel><TextBlock Text="CLAUDE" Foreground="#E2E8F0" FontWeight="Bold" FontSize="12"/><TextBlock Text="5h session" Foreground="#CBD5E1" FontWeight="SemiBold" FontSize="11" Margin="0,14,0,5"/><Border Background="#334155" Height="8" CornerRadius="4"><Border x:Name="Claude5Fill" Background="#22C55E" Width="0" HorizontalAlignment="Left" CornerRadius="4"/></Border><Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock x:Name="Claude5Info" Foreground="#94A3B8" FontSize="11"/><TextBlock x:Name="Claude5Reset" Grid.Column="1" Foreground="#94A3B8" FontSize="11" HorizontalAlignment="Right"/></Grid><TextBlock Text="7d weekly" Foreground="#CBD5E1" FontWeight="SemiBold" FontSize="11" Margin="0,17,0,5"/><Border Background="#334155" Height="8" CornerRadius="4"><Border x:Name="Claude7Fill" Background="#22C55E" Width="0" HorizontalAlignment="Left" CornerRadius="4"/></Border><Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock x:Name="Claude7Info" Foreground="#94A3B8" FontSize="11"/><TextBlock x:Name="Claude7Reset" Grid.Column="1" Foreground="#94A3B8" FontSize="11" HorizontalAlignment="Right"/></Grid></StackPanel>
       </Border>
+      <Border x:Name="ClaudeAuthNotice" Background="#1E293B" CornerRadius="10" Padding="10,7" Margin="0,0,0,8" Visibility="Collapsed"><TextBlock x:Name="ClaudeAuthStatus" FontSize="10" TextWrapping="Wrap"/></Border>
       <Border Background="#1E293B" CornerRadius="10" Margin="0,0,0,8"><Button x:Name="ForceRefresh" Content="강제 새로고침" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border>
       <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="8"/><ColumnDefinition/><ColumnDefinition Width="8"/><ColumnDefinition/></Grid.ColumnDefinitions><Border Background="#1E293B" CornerRadius="10"><Button x:Name="WidgetToggle" Content="Hide widget" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border><Border Grid.Column="2" Background="#1E293B" CornerRadius="10"><Button x:Name="Configure" Content="Configure" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border><Border Grid.Column="4" Background="#1E293B" CornerRadius="10"><Button x:Name="Exit" Content="Exit" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" Height="30" FontSize="10"/></Border></Grid>
     </StackPanel>
@@ -592,11 +626,25 @@ $taskbarWidget.ShowInTaskbar = $false
 $taskbarWidget.TopMost = $true
 $taskbarWidget.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 
+function Set-ClaudeAuthNotice($message, [bool]$isError = $false) {
+    $notice = $dashboard.FindName('ClaudeAuthNotice')
+    $status = $dashboard.FindName('ClaudeAuthStatus')
+    if (-not $message) {
+        $notice.Visibility = [System.Windows.Visibility]::Collapsed
+        return
+    }
+    $status.Text = $message
+    $converter = [System.Windows.Media.BrushConverter]::new()
+    $status.Foreground = $converter.ConvertFromString($(if ($isError) { '#F59E0B' } else { '#22C55E' }))
+    $notice.Visibility = [System.Windows.Visibility]::Visible
+}
+
 function Set-WpfUsageCard($provider, $result) {
     $fiveInfo = $dashboard.FindName("${provider}5Info"); $fiveReset = $dashboard.FindName("${provider}5Reset"); $fiveFill = $dashboard.FindName("${provider}5Fill")
     $sevenInfo = $dashboard.FindName("${provider}7Info"); $sevenReset = $dashboard.FindName("${provider}7Reset"); $sevenFill = $dashboard.FindName("${provider}7Fill")
     if ($result.error) {
-        $fiveInfo.Text = '불러올 수 없음'; $fiveReset.Text = $result.error; $sevenInfo.Text = '불러올 수 없음'; $sevenReset.Text = $result.error
+        $fiveInfo.Text = '조회 실패'; $fiveReset.Text = '아래 안내 확인'; $sevenInfo.Text = '조회 실패'; $sevenReset.Text = '아래 안내 확인'
+        if ($provider -eq 'Claude') { Set-ClaudeAuthNotice $result.error $true }
         $fiveFill.Width = 0; $sevenFill.Width = 0; return
     }
     $fivePercent = Get-UsagePercent $result.five; $sevenPercent = Get-UsagePercent $result.seven
@@ -606,6 +654,7 @@ function Set-WpfUsageCard($provider, $result) {
     $converter = [System.Windows.Media.BrushConverter]::new()
     $fiveFill.Background = $converter.ConvertFromString(('#{0:X2}{1:X2}{2:X2}' -f (Get-GaugeColor $fivePercent).R, (Get-GaugeColor $fivePercent).G, (Get-GaugeColor $fivePercent).B))
     $sevenFill.Background = $converter.ConvertFromString(('#{0:X2}{1:X2}{2:X2}' -f (Get-GaugeColor $sevenPercent).R, (Get-GaugeColor $sevenPercent).G, (Get-GaugeColor $sevenPercent).B))
+    if ($provider -eq 'Claude') { Set-ClaudeAuthNotice $result.status }
 }
 
 function Set-BadgeMetric($label, $dot, $text, $percent) {
