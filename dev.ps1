@@ -29,6 +29,7 @@ public static class UsageTaskbarNative
     [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetParent(IntPtr child, IntPtr newParent);
     [DllImport("user32.dll", SetLastError = true)] public static extern int GetWindowLong(IntPtr window, int index);
     [DllImport("user32.dll", SetLastError = true)] public static extern int SetWindowLong(IntPtr window, int index, int style);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll", SetLastError = true)] public static extern bool GetWindowRect(IntPtr window, out RECT rectangle);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool MoveWindow(IntPtr window, int x, int y, int width, int height, bool repaint);
@@ -414,9 +415,27 @@ function Update-TaskbarWidgetBitmap($x, $y, $width, $height) {
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
 }
 
+function Test-FullScreenForegroundWindow {
+    try {
+        $foreground = [UsageTaskbarNative]::GetForegroundWindow()
+        if ($foreground -eq [IntPtr]::Zero) { return $false }
+        $windowRect = [UsageTaskbarNative+RECT]::new()
+        if (-not [UsageTaskbarNative]::GetWindowRect($foreground, [ref]$windowRect)) { return $false }
+        $screenBounds = [System.Windows.Forms.Screen]::FromHandle($foreground).Bounds
+        $tolerance = 4
+        return ([Math]::Abs($windowRect.Left - $screenBounds.Left) -le $tolerance -and
+            [Math]::Abs($windowRect.Top - $screenBounds.Top) -le $tolerance -and
+            [Math]::Abs($windowRect.Right - $screenBounds.Right) -le $tolerance -and
+            [Math]::Abs($windowRect.Bottom - $screenBounds.Bottom) -le $tolerance)
+    } catch {
+        return $false
+    }
+}
+
 function Set-TaskbarWidgetPosition {
     if (-not $taskbarWidget -or $taskbarWidget.IsDisposed) { return }
     if (-not (Test-TaskbarWidgetEnabled)) { $taskbarWidget.Hide(); return }
+    if (Test-FullScreenForegroundWindow) { $taskbarWidget.Hide(); return }
     $width = Get-TaskbarWidgetWidth
     if ($width -le 0) { $taskbarWidget.Hide(); return }
     $taskbar = [UsageTaskbarNative]::FindWindow('Shell_TrayWnd', $null)
